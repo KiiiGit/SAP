@@ -1,0 +1,566 @@
+HASH(""VERSION"" => ""1.1"";;""PACKAGES"" => HASH(""clientInstaller"" => HASH(""git_hash"" => undef;;""script"" => ""use File::Basename\;
+use SDB::Install::System\;
+use SAPDB::Install::MD5Sum\;
+use SDB::Install::Tools\;
+use SDB::Install::SysVars qw \($isWin $path_separator\)\;
+use SDB::Install::DirectoryWalker\;
+use SDB::Install::Globals qw\($gSignatureManifestName\)\;
+
+
+our $filelistFile  = 'filelist.clientinst'\;
+our @installer_dirs = qw \(install\)\;
+
+sub initPackage{
+	my \($self\) = @_\;
+	if \($self->isa \('SDB::Install::Package::Installable'\)\){
+		$self->FindKitFiles \(\)\;
+		my %union = \(%{$self->{data}->{files}},%{$self->{kitfiles}}\)\;
+		my $tmp\;
+		my $size = 0\;
+		foreach my $key \(sort keys \(%union\)\){
+			$tmp .= $union{$key}->{checksum}\;
+			$size +=  $union{$key}->{size}\;
+		}
+		$self->{data}->{checksum} = MD5Str \($tmp\)\;
+		$self->{data}->{size} = $size\;
+	}
+	return 1\;
+}
+
+sub GetNumberOfFiles \($\) {
+    my \($self\) = @_\;
+    my $nFiles = $self->SUPER::GetNumberOfFiles\(\)\;
+
+    if \($self->isa \('SDB::Install::Package::Installable'\) && defined $self->{kitfiles}\){
+        $nFiles += scalar keys %{$self->{kitfiles}}\;
+    }
+    return $nFiles\;
+}
+
+sub FindKitFiles{
+    my \($self\) = @_\;
+    $self->AddMessage \('Installler is part of installation kit'\)\;
+    my $dir = $SAPDB::Install::Config{'RuntimeDir'}\;
+    my $entries = find \($dir, $self, FIND_TYPE_FILE, undef, undef, '/'\)\;
+    if \(!defined $entries\){
+        return undef\;
+    }
+    my %filelist\;
+    my %filesource\;
+    my $prefix  = 'install/instruntime'\;
+    my $file\;
+    my @statbuf\;
+    foreach $entry \(@$entries\){
+        $file = $dir . $path_separator . $entry\;
+        @statbuf = stat \($file\)\;
+        my %info = \(
+                'checksum' => MD5Sum \($file\),
+                'size' => $statbuf [7],
+                'mode' => $statbuf [2] & 07777,
+                'mtime' => $statbuf [9]
+                \)\;
+
+        $filelist{$prefix .'/'. $entry} = \%info\;
+        $filesource{$prefix .'/'. $entry} = $file\;
+    }
+    $self->{kitfiles} = \%filelist\;
+    $self->{filesource} = \%filesource\;
+    return 1\;
+}
+
+sub Extract{
+	my \($self, $destdir\) = @_\;
+	if \($self->isa \('SDB::Install::Package::Installed'\)\){
+		die \(\"Extract \(\) is not allowed in this context.\n\"\)\;
+	}
+	# extract files from archive:
+	unless \(defined $self->SUPER::Extract\(\)\){
+		return undef\;
+	}	
+	# copy files from installation kit and add them:
+	unless \(defined $self->{kitfiles}\){
+		$self->FindKitFiles \(\)\;
+	}
+	my $config = {'createdir' => 1}\;
+	if \($^O !~ /mswin/i\){
+		$config->{uid} = $self->{installation}->getUID \(\)\;
+		$config->{gid} = $self->{installation}->getGID\(\)\;
+	}	
+	my $files = $self->{kitfiles}\;
+	my $mode\;	
+	my $path = defined $destdir ? $destdir : $self->getPath \(\)\;
+	foreach my $file \(keys \(%$files\)\){
+		my $msg = $self->AddProgressMessage \('copying '.$file\)\;
+		my $do_chmod = 0\;
+		if \($file =~ /\.tgz$/i\){
+			$mode = 0444\;
+		}
+		else{
+			$mode = 0555\;
+		}
+		if \($^O !~ /mswin/i and $files->{$file}->{mode} != $mode\){
+			$files->{$file}->{mode} = $mode\;
+			$do_chmod = 1\;
+		}
+		$msg->{submsg} = [$self->GenMsg \('INFO', sprintf \(\"file info: mode = 0%o, size = %d bytes\", $files->{$file}->{mode} & 07777,$files->{$file}->{size}\)\)]\;
+		# try to remove readonly attribute on windows:
+		if \($isWin\){
+			my @stat = stat \($path.'/'.$file\)\;
+			if \(@stat && \($stat[2] & 0222\) == 0\){
+				chmod \($stat[2] | 0222, $path.'/'.$file\)\;
+			} 
+		}
+		unless \(defined copy_file \($self->{filesource}->{$file},$path.'/'.$file,$config\)\){
+			$self->AddError \('cannot copy file '.$file ,$config\)\;
+			return undef\;
+		}
+		if \($do_chmod\){
+			if \(! chmod \($files->{$file}->{mode}, $path.'/'.$file\)\){
+				$self->AddError \(\"cannot chmod file $path/$file: $!\"\)\;
+				return undef\;
+			}	
+		}
+		$self->{data}->{files}->{$file} = $files->{$file}\;
+	}
+
+	# copy signature manifest
+	my $dir = $SAPDB::Install::Config{'RuntimeDir'}\;
+	my \($installExeDir\) = \($dir =~ /\(.*[^\\\/]\)[\\\/]+instruntime[\\\/]*.*?/\)\;
+
+	my $srcFile = undef\;
+	if \(-f $installExeDir.$path_separator.$gSignatureManifestName\) {
+		$srcFile = $installExeDir.$path_separator.$gSignatureManifestName\;
+	} elsif \(-f dirname\($installExeDir\).$path_separator.$gSignatureManifestName\) {
+		$srcFile = dirname\($installExeDir\).$path_separator.$gSignatureManifestName\;
+	}
+	my $tgtFile = join \($path_separator, $path, @installer_dirs, $gSignatureManifestName\)\;
+
+	if \($srcFile && -f $srcFile\) {
+		if \(!defined copy_file \($srcFile,$tgtFile,$config\)\){
+			$self->AddMessage \('cannot copy file '.$srcFile.' to '.$tgtFile ,$config\)\;
+		}
+		if \(!\($^O =~ /mswin/i\) && -f $tgtFile && !chmod\(0644, $tgtFile\)\) {
+			$self->AddMessage \(\"cannot chmod file '$tgtFile': $!\"\)\;
+		}
+
+		# copy file list for verification with manifest
+		$srcFile = $installExeDir.$path_separator.$filelistFile\;
+		$tgtFile = join \($path_separator, $path, @installer_dirs, $filelistFile\)\;
+
+		unless \(-f $srcFile && defined copy_file \($srcFile,$tgtFile,$config\)\){
+			$self->AddMessage \('cannot copy file '.$srcFile.' to '.$tgtFile ,$config\)\;
+		}
+		if \($^O =~ /mswin/i\){
+			return 1\;
+		}
+
+		if\(-f $tgtFile && !chmod\(0644, $tgtFile\)\) {
+			$self->AddMessage \(\"cannot chmod file '$tgtFile': $!\"\)\;
+		}
+	} else {
+		$self->AddMessage \('cannot copy signature manifest file '.$gSignatureManifestName.': file not found'\)\;
+	}
+
+	if \($^O =~ /mswin/i\){
+		return 1\;
+	}
+
+	# mode 0755 for all sub directories:
+	my $tgtDir = join \($path_separator, $path, @installer_dirs\)\;
+	if\(! chmod \(0755, $tgtDir\)\) {
+		$self->AddError \(\"cannot chmod directory '$tgtDir': $!\"\)\;
+		return undef\;
+	}
+    my $dirWalker = SDB::Install::DirectoryWalker->new\(undef, undef, undef, undef, undef, undef,
+        sub{   # action callback
+            my $isDir = $_[6]\;
+            if\($isDir\) {
+                my $tgt = $_[3].$path_separator.$_[4]\;
+                if\(! chmod \(0755, $tgt\)\) {
+                    $_[1]->AddError \(\"cannot chmod file '$tgt': $!\"\)\;
+                    return undef\;
+                }
+            }
+            return 1\;
+        },
+        undef, undef, 1, 1, 1 \)\;
+    my $rc = $dirWalker->findAndProcess\($tgtDir\)\;
+    if\(not defined $rc\) {
+        $self->AddError \($dirWalker->getErrorString\(\)\)\;
+        return undef\;
+    }
+	return 1\;	
+}
+
+sub Postuninstall{
+    my \($self\) = @_\;
+    my $path = $self->getPath \(\)\;
+    my $sigFile = join \($path_separator, $path, @installer_dirs, $gSignatureManifestName\)\;
+    my $lstFile = join \($path_separator, $path, @installer_dirs, $filelistFile\)\;
+    foreach my $file \($sigFile, $lstFile\){
+        if \(unlink \($file\)\){
+            $self->getMsgLst\(\)->addMessage \(\"File '$file' deleted\"\)\;
+        }
+        else{
+            $self->getMsgLst\(\)->addError \(\"Cannot delete '$file': $!\"\)\;
+        }
+    }
+	# Change the current working directory, because installer uses its
+	# runtime directory for this purpose.
+	# Otherwise the installer directory will survive the uninstallation
+	# on Windows:
+	if \($isWin\){
+		chdir \('C:\\'\)\;
+	}
+	return 1\;
+}
+
+
+#This function overrides 'getShortcutDefinitions'
+#from 'Package.pm'.
+sub getShortcutDefinitions {
+    my \($self\) = @_\;
+    my $retval\;
+        $retval = []\;
+    return $retval\;
+}
+
+1\;
+
+"";;""valid"" => ""1"";;""version"" => ""1.00.120.091.1519763291"";;""checksum"" => ""ac2490abc2c6636662f2a34a6d89ad0c"";;""buildstring"" => ""1.00.120.091.1519763291"";;""size"" => ""20562807"";;""files"" => HASH(""install/instruntime/IO.dll"" => HASH(""checksum"" => ""20bb33563897b4fb01e5757ac91b6b78"";;""mtime"" => ""1533984900"";;""mode"" => ""438"";;""size"" => ""13824"");;""install/instruntime/Dumper.dll"" => HASH(""mode"" => ""438"";;""size"" => ""25600"";;""checksum"" => ""a2fa289be7bd99281c18bfcd2db9b77d"";;""mtime"" => ""1533984900"");;""install/instruntime/Exporter.pm"" => HASH(""size"" => ""18746"";;""mode"" => ""438"";;""checksum"" => ""358c4022647b971c7c4f3a4157b8343e"";;""mtime"" => ""1533984900"");;""install/instruntime/version/regex.pm"" => HASH(""mtime"" => ""1533984904"";;""checksum"" => ""1d9abab61fb12ffaba9e42df592eae53"";;""mode"" => ""438"";;""size"" => ""4100"");;""install/instruntime/msvcp100.dll"" => HASH(""mtime"" => ""1533984900"";;""checksum"" => ""e3c817f7fe44cc870ecdbcbc3ea36132"";;""size"" => ""421200"";;""mode"" => ""438"");;""install/instruntime/version.pm"" => HASH(""mtime"" => ""1533984901"";;""checksum"" => ""67d4ba2c969a3dc66f0c0f4722abafb8"";;""size"" => ""1622"";;""mode"" => ""438"");;""install/instruntime/lcm_pm_ext.tgz"" => HASH(""mode"" => ""438"";;""size"" => ""1002413"";;""mtime"" => ""1533984900"";;""checksum"" => ""90f403e06944280619018f5d5738c608"");;""install/instruntime/lcm_res.tgz"" => HASH(""mtime"" => ""1533984900"";;""checksum"" => ""801029d7f070ca5bc3aa934fc7569d79"";;""mode"" => ""438"";;""size"" => ""132987"");;""install/instruntime/warnings/register.pm"" => HASH(""mode"" => ""438"";;""size"" => ""759"";;""checksum"" => ""2d8f6ce093a2176b982c0e12c0194b3b"";;""mtime"" => ""1533984904"");;""install/instruntime/lcm_pm.tgz"" => HASH(""checksum"" => ""118d3bdd1d23f103b55f26201bd86791"";;""mtime"" => ""1533984900"";;""mode"" => ""438"";;""size"" => ""1192413"");;""install/instruntime/HiRes.dll"" => HASH(""checksum"" => ""49182465d32b322404802e1bf314a612"";;""mtime"" => ""1533984900"";;""size"" => ""15360"";;""mode"" => ""438"");;""install/instruntime/constant.pm"" => HASH(""checksum"" => ""56cde6eba0f667ab56196613df3933c1"";;""mtime"" => ""1533984900"";;""size"" => ""14724"";;""mode"" => ""438"");;""install/instruntime/wxmsw30u_vc_sdb.dll"" => HASH(""mode"" => ""438"";;""size"" => ""12002816"";;""checksum"" => ""f16ff1a23fdb058baf57f2b36b27a04e"";;""mtime"" => ""1533984904"");;""install/instruntime/Cwd.dll"" => HASH(""checksum"" => ""b6f98f5db34f3c9a60674e83bd106dd4"";;""mtime"" => ""1533984900"";;""mode"" => ""438"";;""size"" => ""12800"");;""install/instruntime/Win32.dll"" => HASH(""mtime"" => ""1533984901"";;""checksum"" => ""dd0163031e7b51787591a05cb2d7abfe"";;""size"" => ""32768"";;""mode"" => ""438"");;""install/instruntime/Base64.dll"" => HASH(""mode"" => ""438"";;""size"" => ""12288"";;""checksum"" => ""0e59f0865ea1af25503325db900c8ebb"";;""mtime"" => ""1533984900"");;""install/instruntime/Getopt/Long.pm"" => HASH(""checksum"" => ""ddf6b9b8c6bc50d0cfcca57da3b4b5b1"";;""mtime"" => ""1533984904"";;""size"" => ""82447"";;""mode"" => ""438"");;""install/instruntime/perl522.dll"" => HASH(""mtime"" => ""1533984901"";;""checksum"" => ""0a2144e80363f0c4779b78f7a530e6ae"";;""mode"" => ""438"";;""size"" => ""1200640"");;""install/instruntime/Socket.dll"" => HASH(""mode"" => ""438"";;""size"" => ""20480"";;""checksum"" => ""f145d4db7f86989fdf4a1e3b1850306a"";;""mtime"" => ""1533984901"");;""install/instruntime/Carp.pm"" => HASH(""mode"" => ""438"";;""size"" => ""30355"";;""mtime"" => ""1533984900"";;""checksum"" => ""c554ce41c752de638aeb0e372d02a580"");;""install/instruntime/Exporter/Heavy.pm"" => HASH(""mtime"" => ""1533984904"";;""checksum"" => ""d8032ca40b44e010673e6dd5816ca66b"";;""size"" => ""6551"";;""mode"" => ""438"");;""install/hdbuninst.exe"" => HASH(""mode"" => ""365"";;""size"" => ""38400"";;""mtime"" => ""1519763930"";;""checksum"" => ""37ed2db4f7cfb3e00f37f564dd29bb10"");;""install/instruntime/overload.pm"" => HASH(""mtime"" => ""1533984901"";;""checksum"" => ""3c13b1c95b630670a05772446e1d3258"";;""size"" => ""53339"";;""mode"" => ""438"");;""install/instruntime/FCGI.dll"" => HASH(""size"" => ""35328"";;""mode"" => ""438"";;""mtime"" => ""1533984900"";;""checksum"" => ""1055c8024b3c2cee0b44a8ebe8828031"");;""install/instruntime/Encode.dll"" => HASH(""checksum"" => ""db5323ec47b87cb6f2910bc384644263"";;""mtime"" => ""1533984900"";;""mode"" => ""438"";;""size"" => ""23552"");;""install/instruntime/strict.pm"" => HASH(""size"" => ""4433"";;""mode"" => ""438"";;""checksum"" => ""d571ab97f280b807da3f442c103b9820"";;""mtime"" => ""1533984901"");;""install/instruntime/vars.pm"" => HASH(""checksum"" => ""613c5318b87aa69b1145ca028f964445"";;""mtime"" => ""1533984901"";;""size"" => ""2414"";;""mode"" => ""438"");;""install/instruntime/overloading.pm"" => HASH(""mode"" => ""438"";;""size"" => ""1808"";;""mtime"" => ""1533984901"";;""checksum"" => ""36e1b34f8175e036d57e51fd7d56becd"");;""install/instruntime/Wx.dll"" => HASH(""checksum"" => ""4573be8933dd75f9a9234f514e6588f3"";;""mtime"" => ""1533984902"";;""mode"" => ""438"";;""size"" => ""2162688"");;""install/instruntime/DND.dll"" => HASH(""mtime"" => ""1533984900"";;""checksum"" => ""e3fd3cf707b46ebb8acc74ff4dd8dd9f"";;""mode"" => ""438"";;""size"" => ""47616"");;""install/instruntime/sdbrun.dll"" => HASH(""size"" => ""721920"";;""mode"" => ""438"";;""mtime"" => ""1533984901"";;""checksum"" => ""6308764feea0d454c4de677c6a1d94dd"");;""install/instruntime/Grid.dll"" => HASH(""mtime"" => ""1533984900"";;""checksum"" => ""e5805b570ed412ef546b34df687d0859"";;""size"" => ""207872"";;""mode"" => ""438"");;""install/hdbinst.exe"" => HASH(""mtime"" => ""1519763930"";;""checksum"" => ""4dcc93e8b6dffe335d11fdff3f8f9733"";;""mode"" => ""365"";;""size"" => ""38400"");;""install/instruntime/Expat.dll"" => HASH(""size"" => ""161280"";;""mode"" => ""438"";;""checksum"" => ""265e4bc804ede2fce10ac0ae18aa96e8"";;""mtime"" => ""1533984900"");;""install/instruntime/warnings.pm"" => HASH(""mtime"" => ""1533984901"";;""checksum"" => ""b657aa2d4f5411b823cb7e18b2133122"";;""size"" => ""44896"";;""mode"" => ""438"");;""install/instruntime/msvcr100.dll"" => HASH(""mtime"" => ""1533984901"";;""checksum"" => ""bf38660a9125935658cfa3e53fdc7d65"";;""mode"" => ""438"";;""size"" => ""773968""));;""isClientPackage"" => ""1"";;""name"" => ""Client Installer"";;""desc"" => ""Client Installer"";;""modtime"" => ""1702542470"";;""debugArchive"" => undef;;""type"" => undef);;""odbc"" => HASH(""checksum"" => ""ae922e21bc4b61265570f1029cd7249e"";;""script"" => ""use SDB::Install::SysVars\;
+use SDB::Install::DebugUtilities\;
+use SDB::Install::System qw \(
+    exec_program
+\)\;
+use SDB::Install::System::Registration::ODBC\;
+
+
+
+sub Register{
+    my \($self\) = @_\;
+    if \($isWin\){
+        my $inst              = $self->{'installation'}\;
+        my $conf              = $inst->getConfiguration\(\)\;
+        my $driverName        = $conf->{'params'}->{'ODBCDriverName'}->{'value'}\;
+        my $path              = $self->getPath \(\)\;
+        my $odbcreg           = $path . $path_separator . 'odbcreg.exe'\;
+        my $dll               = 'libodbcHDB.dll'\;
+        if\(! -f $odbcreg\) {
+            $odbcreg = $path . $path_separator . 'odbcreg32.exe'\;
+            $dll = 'libodbcHDB32.dll'\;
+        }
+        if\(not $self->IsUpdate\(\)\) {
+            # we only do registration when we are a new install, not a sw update.
+    		my $msg = $self->AddMessage \(\"Registering ODBC driver as \\"$driverName\\".\"\)\;
+    		my $cfg =  {}\;
+    		my $rc = exec_program \($odbcreg, ['-i', $driverName, '-p',$path, '-d', $dll],$cfg\)\;
+    		if \(!defined $rc || $rc != 0\){
+    			$self->AddError \(\"Could not register ODBC driver \\"$driverName\\"\", $cfg\)\;
+    			$self->AddSubMsgLst \($msg, $cfg\)\;
+    			return undef\;
+    		}
+    		$self->AddSubMsgLst \($msg, $cfg\)\;
+        }
+        else {
+            # when we are a sw update, we give a warning when we
+            # could not find a registration of our driver in the registry.
+            # Note that registrations may have been deleted intentionally,
+            # e.g. for security reasons.
+            my $odbcObj = new SDB::Install::System::Registration::ODBC\(\)\;
+            my $myNames  = $odbcObj->getDriverNamesAssignedToInstallation\($inst\)\;
+            if\( \(not defined $myNames\) || scalar\(@{$myNames}\) <= 0\) {
+                $self->AddWarning\(\"ODBC Driver \\"\".$path.$path_separator.$dll.\"\\" is not registered.\"\)\;
+                $self->AddWarning\(\"If this is not intentional, registration could be done as follows:\"\)\;
+                $self->AddWarning\(\"\\"$odbcreg\\" -i <driverName> -p \\"$path\\" -d $dll\"\)\;
+            }
+        }
+	}
+	return 1\;
+}
+
+#----------------------------------------------------------------------------
+
+sub Unregister{
+	my \(
+	   $self
+    \) = @_\;
+	if \($isWin\){
+        my $inst        = $self->{'installation'}\;
+        my $conf        = $inst->getConfiguration\(\)\;
+		my $path        = $self->getPath\(\)\;
+		my $odbcreg     = $path . $path_separator . 'odbcreg.exe'\;
+        if \(! -f $odbcreg\){
+            $odbcreg = $path . $path_separator . 'odbcreg32.exe'\;
+        }
+        my $odbcObj = new SDB::Install::System::Registration::ODBC\(\)\;
+        my $myNames  = $odbcObj->getDriverNamesAssignedToInstallation\($inst\)\;
+        if\(defined $myNames\) {
+            foreach my $driverName \(@$myNames\) {
+        		my $msg = $self->AddMessage \(\"Unregistering ODBC driver \\"$driverName\\".\"\)\;
+        		my $cfg =  {}\;
+        		my $rc = exec_program\($odbcreg, ['-r', $driverName], $cfg\)\;
+        		if \(!defined $rc || $rc != 0\){
+        			$self->AddError\(\"Could not unregister ODBC driver \\"$driverName\\".\", $cfg\)\;
+        			$self->AddSubMsgLst\($msg, $cfg\)\;
+        			return undef\;
+        		}
+        		$self->AddSubMsgLst\($msg, $cfg\)\;
+            }
+        }
+	}
+	return 1\;
+}
+
+#----------------------------------------------------------------------------
+
+sub Postinstall\(\) {
+        my \(
+            $self
+        \) = @_\;
+        my $path = $self->getPath\(\)\;
+        my $exeExt = $isWin ? '.exe' : ''\;
+        my $odbcCons = $path.$path_separator.'hdbodbc_cons'.$exeExt\;
+        if\(! -f $odbcCons\) {
+            $odbcCons = $path.$path_separator.'hdbodbc_cons32'.$exeExt\;
+        }
+        if\(-f $odbcCons\) {
+            $self->AddMessage\(\"Running $odbcCons to detect and remove invalid shared memory.\"\)\;
+            my $rc = exec_program\($odbcCons, ['-w', '256']\)\;
+            if\(defined $rc\) {
+                $self->AddMessage\(\"$odbcCons returned $rc.\"\)\;
+            }
+        }
+        return 1\;
+}
+
+
+1\;
+"";;""valid"" => ""1"";;""version"" => ""1.00.120.091.1519763291"";;""requires"" => ARRAY(HASH(""str"" => ""manifest"";;""id"" => ""manifest""));;""git_hash"" => undef;;""debugArchive"" => ""ODBC.DEBUG.TGZ"";;""type"" => undef;;""isClientPackage"" => ""1"";;""name"" => ""ODBC"";;""modtime"" => ""1702542468"";;""desc"" => ""ODBC Driver"";;""files"" => HASH(""libodbcHDB32.pdb"" => HASH(""dbg"" => ""1"";;""mtime"" => ""1519764187"";;""checksum"" => ""96a78481fbb63cebc3db52ed214a2c33"";;""size"" => ""3787776"";;""mode"" => ""420"");;""sdk/odbc/incl/sqlucode.h"" => HASH(""mode"" => ""420"";;""size"" => ""23569"";;""checksum"" => ""f84ae29480ed6d2b79c3d88fdc5fdaa7"";;""mtime"" => ""1519763984"");;""sdk/odbc/incl/sqltypes.h"" => HASH(""mtime"" => ""1519763984"";;""checksum"" => ""2dc4641eea4d4f607791e9a11e951c5d"";;""mode"" => ""420"";;""size"" => ""9340"");;""sdk/odbc/incl/sqlext.h"" => HASH(""mtime"" => ""1519763984"";;""checksum"" => ""d2ee7aa8782c034339bb05dcd40cf544"";;""size"" => ""78023"";;""mode"" => ""420"");;""libodbcHDB32.lib"" => HASH(""mode"" => ""420"";;""size"" => ""180408"";;""mtime"" => ""1519764186"";;""checksum"" => ""3fc84242d10eda017e3d0f2c9facc9a0"");;""hdbodbc_cons32.exe"" => HASH(""mtime"" => ""1519764184"";;""checksum"" => ""d10ec77c9b30efe982eb2aacdcc84acb"";;""mode"" => ""493"";;""size"" => ""1168896"");;""sdk/odbc/incl/sqlsdbodbc.h"" => HASH(""mtime"" => ""1519763984"";;""checksum"" => ""814422bfb7f34d62f03781191ee90e99"";;""size"" => ""5634"";;""mode"" => ""420"");;""odbcreg32.exe"" => HASH(""mode"" => ""493"";;""size"" => ""17408"";;""mtime"" => ""1519764018"";;""checksum"" => ""4309f86fb4fe53274125428c01c88303"");;""libodbcHDB32.dll"" => HASH(""checksum"" => ""bc1253bee24f922c4c26d3fe64da028b"";;""mtime"" => ""1519764188"";;""size"" => ""5599232"";;""mode"" => ""420"");;""sdk/odbc/incl/sql.h"" => HASH(""mode"" => ""420"";;""size"" => ""30839"";;""checksum"" => ""9cbca1886d6714608d0bb6bef37aefe2"";;""mtime"" => ""1519763984""));;""buildstring"" => ""1.00.120.091.1519763291"";;""size"" => ""10901125"");;""manifest"" => HASH(""version"" => ""1.00.120.091.1519763291"";;""valid"" => ""1"";;""script"" => ""sub Postinstall{
+    # load/refresh manifest
+    $_[0]->{installation}->getManifest \(1\)\;
+}
+
+1\;
+"";;""checksum"" => ""c5e84b012fe42ee49e1a5a2a675ff657"";;""git_hash"" => undef;;""type"" => undef;;""debugArchive"" => undef;;""size"" => ""1024"";;""buildstring"" => ""1.00.120.091.1519763291"";;""files"" => HASH(""manifest"" => HASH(""checksum"" => ""24301e7e83fd382bd0c5a38874c8c9f3"";;""mtime"" => ""1519763998"";;""size"" => ""1024"";;""mode"" => ""420""));;""desc"" => ""Product Manifest"";;""modtime"" => ""1702542467"";;""name"" => ""Product Manifest"";;""isClientPackage"" => ""1"");;""jdbc"" => HASH(""buildstring"" => ""1.00.120.091.1519763291"";;""size"" => ""926572"";;""files"" => HASH(""ngdbc.jar"" => HASH(""checksum"" => ""8cf8c64c07c0f0813813038d7fdb987b"";;""mtime"" => ""1519763986"";;""size"" => ""926572"";;""mode"" => ""420""));;""isClientPackage"" => ""1"";;""name"" => ""JDBC"";;""desc"" => ""JDBC Driver"";;""modtime"" => ""1702542468"";;""debugArchive"" => undef;;""type"" => undef;;""git_hash"" => undef;;""requires"" => ARRAY(HASH(""id"" => ""manifest"";;""str"" => ""manifest""));;""script"" => ""use strict\;
+
+our $listname = 'hdbclient.lst'\;
+
+sub getExternalFileListName{
+    return $listname\;
+}
+
+1\;
+"";;""version"" => ""1.00.120.091.1519763291"";;""valid"" => ""1"";;""checksum"" => ""51295b3798b97f167eaff5f857189f71"");;""repotools"" => HASH(""name"" => ""REPOTOOLS"";;""isClientPackage"" => ""1"";;""modtime"" => ""1702542467"";;""desc"" => ""Repository Tools"";;""files"" => HASH(""rtt/lib/rtt.jar"" => HASH(""size"" => ""99705"";;""mode"" => ""420"";;""mtime"" => ""1519764181"";;""checksum"" => ""ae448a24e582bec033f53813d5e95fe4"");;""rtt/lib/xliff_sapmetadata-1.2.jar"" => HASH(""mode"" => ""420"";;""size"" => ""41316"";;""mtime"" => ""1519764181"";;""checksum"" => ""9541dde394fb88eadc69a6dba0952404"");;""rtt/lib/tc_mlt_tsapi-0.0.361016.jar"" => HASH(""size"" => ""286833"";;""mode"" => ""420"";;""checksum"" => ""cc6f1efe75ccdcf67ddd7e6d64160765"";;""mtime"" => ""1519764181"");;""rtt/lib/tc_logging_java-1.0.0.jar"" => HASH(""mode"" => ""420"";;""size"" => ""311230"";;""mtime"" => ""1519764181"";;""checksum"" => ""3c0c956b47998cd4fd4695d39d2f25d1"");;""rtt/lib/sapjco3.jar"" => HASH(""checksum"" => ""a00c344db3c8e633838cabe3a099377e"";;""mtime"" => ""1519764181"";;""mode"" => ""420"";;""size"" => ""1478758"");;""regi.exe"" => HASH(""size"" => ""6941696"";;""mode"" => ""493"";;""checksum"" => ""bc604cae335f010a7330a09a5a237339"";;""mtime"" => ""1519764210"");;""rtt/lib/xliff_core-1.2.jar"" => HASH(""size"" => ""506895"";;""mode"" => ""420"";;""mtime"" => ""1519764181"";;""checksum"" => ""c1688203b65da8fd62d3f2094521f0e8"");;""rtt/rtt.properties"" => HASH(""mtime"" => ""1519764181"";;""checksum"" => ""b87bbc44f8455a0ed71f0755d9dea842"";;""size"" => ""476"";;""mode"" => ""420"");;""rtt/lib/json-rpc-1.0.jar"" => HASH(""mtime"" => ""1519764181"";;""checksum"" => ""d22063588616576c96d6525cae502f38"";;""size"" => ""76889"";;""mode"" => ""420"");;""rtt/lib/xliff_api-1.2.jar"" => HASH(""mode"" => ""420"";;""size"" => ""252874"";;""mtime"" => ""1519764181"";;""checksum"" => ""187ad96084d163cfce346c197fcd10c1"");;""rtt/lib/sapjco3.dll"" => HASH(""mtime"" => ""1519764181"";;""checksum"" => ""9f9beb360e31ee92322040294f025897"";;""mode"" => ""420"";;""size"" => ""4399104"");;""rtt/Readme.txt"" => HASH(""size"" => ""21625"";;""mode"" => ""420"";;""mtime"" => ""1519764181"";;""checksum"" => ""7ed43ead686b494aee795dc49d6f4abf"");;""rtt/lib/tc_mlt_base-0.0.361795.jar"" => HASH(""size"" => ""930176"";;""mode"" => ""420"";;""checksum"" => ""cdf3bb3ea1bded0b48d6c46ce98f4286"";;""mtime"" => ""1519764181"");;""rtt.bat"" => HASH(""size"" => ""92"";;""mode"" => ""493"";;""mtime"" => ""1519764181"";;""checksum"" => ""b1240ffc89de920e38b19fc7f0b4b44b""));;""size"" => ""15347669"";;""buildstring"" => ""1.00.120.091.1519763291"";;""debugArchive"" => undef;;""type"" => undef;;""requires"" => ARRAY(HASH(""str"" => ""manifest"";;""id"" => ""manifest""));;""git_hash"" => undef;;""checksum"" => ""055d1087d0f96abe877aaabec17015f1"";;""script"" => ""use strict\;
+
+our $listname = 'hdbclient.lst'\;
+
+sub getExternalFileListName{
+    return $listname\;
+}
+
+1\;
+"";;""valid"" => ""1"";;""version"" => ""1.00.120.091.1519763291"");;""odbo"" => HASH(""files"" => HASH(""SAP_HANA_ODBO_Driver_DE.chm"" => HASH(""size"" => ""50807"";;""mode"" => ""292"";;""mtime"" => ""1519763933"";;""checksum"" => ""91a93bc208eed14d2b8f5a774cbc0a83"");;""SAPNewDBMDXProvider.dll"" => HASH(""checksum"" => ""e90f6d84ebba25eca51119adf18c9545"";;""mtime"" => ""1519763933"";;""mode"" => ""292"";;""size"" => ""1326080"");;""SAPNewDBMDXProviderEr.dll"" => HASH(""mode"" => ""292"";;""size"" => ""71680"";;""mtime"" => ""1519763933"";;""checksum"" => ""c239546c52fde4307b98744c55cab983"");;""SAP_HANA_ODBO_Driver_JP.chm"" => HASH(""checksum"" => ""3eafb1a033ef3c3a688eb095274ba4d8"";;""mtime"" => ""1519763933"";;""mode"" => ""292"";;""size"" => ""47005"");;""SAP_HANA_ODBO_Driver_FR.chm"" => HASH(""checksum"" => ""7c1f6897a3c004421dace8369479e486"";;""mtime"" => ""1519763933"";;""mode"" => ""292"";;""size"" => ""50873"");;""SAP_HANA_ODBO_DRIVER_EN.chm"" => HASH(""mode"" => ""292"";;""size"" => ""50053"";;""checksum"" => ""a5ec0f43be8cd1bfa52417fe6d57ce78"";;""mtime"" => ""1519763933""));;""size"" => ""1596498"";;""buildstring"" => ""1.00.120.091.1519763291"";;""name"" => ""ODBO"";;""isClientPackage"" => ""1"";;""desc"" => ""OLE DB for OLAP"";;""modtime"" => ""1702542467"";;""debugArchive"" => undef;;""type"" => undef;;""git_hash"" => undef;;""requires"" => ARRAY(HASH(""str"" => ""sqldbc"";;""id"" => ""sqldbc""));;""script"" => ""use SDB::Install::SysVars\;
+use SDB::Install::System qw \(exec_program getSysPath\)\;
+
+
+our  @dlls = qw \(SAPNewDBMDXProvider.dll SAPNewDBMDXProviderEr.dll\)\;
+
+sub Register{
+	if \(!$isWin\){
+		return 1\;
+	}
+	my \($self\) = @_\;
+	my $path = $self->getPath \(\)\;
+	my $errlst = new SDB::Install::MsgLst \(\)\;
+	my $system32 = getSysPath \($errlst\)\;
+	if \(!defined $system32\){
+		$self->AddError \(\"Cannot determine system32 path\", $errlst\)\;
+		return undef\;
+	}
+	my $regsvr32 = $system32 . $path_separator . 'regsvr32.exe'\;
+	my \($cfg, $rc\)\;
+	my $msg = $self->AddMessage \(\"Registering MDX provider\"\)\;
+	local %ENV = %ENV\;
+	$ENV{PATH} = $path . $env_path_separator . $ENV{PATH}\;
+	foreach my $dll \(@dlls\){
+		$cfg = {}\;
+		$rc = exec_program \($regsvr32, ['/s', $path . $path_separator . $dll], $cfg\)\;
+		if \(!defined $rc || $rc != 0\){
+			$self->PushError \(\"Cannot register MDX provider\", $cfg\)\;
+			$self->AddSubMsgLst \($msg, $cfg\)\;
+			return undef\;
+		}
+		$self->AddSubMsgLst \($msg, $cfg\)\; 
+	
+	}
+	return 1\;
+}
+
+
+sub Unregister{
+	if \(!$isWin\){
+		return 1\;
+	}
+	my \($self\) = @_\;
+	my $path = $self->getPath \(\)\;
+	my $errlst = new SDB::Install::MsgLst \(\)\;
+	my $system32 = getSysPath \($errlst\)\;
+	if \(!defined $system32\){
+		$self->AddError \(\"Cannot determine system32 path\", $errlst\)\;
+		return undef\;
+	}
+	my $regsvr32 = $system32 . $path_separator . 'regsvr32.exe'\;
+	my \($cfg, $rc\)\;
+	my $msg = $self->AddMessage \(\"Unregistering MDX provider\"\)\;
+	local %ENV = %ENV\;
+	$ENV{PATH} = $path . $env_path_separator . $ENV{PATH}\;
+	foreach my $dll \(@dlls\){
+		$cfg = {}\;
+		$rc = exec_program \($regsvr32, ['/u','/s', $path . $path_separator . $dll], $cfg\)\;
+		if \(!defined $rc || $rc != 0\){
+			$self->PushError \(\"Cannot unregister MDX provider\", $cfg\)\;
+			$self->AddSubMsgLst \($msg, $cfg\)\;
+			return undef\;
+		}
+		$self->AddSubMsgLst \($msg, $cfg\)\; 
+	
+	}
+	return 1\;
+}
+
+1\;
+"";;""version"" => ""1.00.120.091.1519763291"";;""valid"" => ""1"";;""checksum"" => ""5fcf1a7a6699e31cb0d0d4f75584c52c"");;""adonet"" => HASH(""version"" => ""1.00.120.091.1519763291"";;""valid"" => ""1"";;""script"" => ""use SDB::Install::SysVars\;
+# use SDB::Install::DebugUtilities\;
+use LCM::ProcessExecutor\;
+use SAPDB::Install::System::Win32::Registry\;
+
+
+#----------------------------------------------------------------------------
+
+sub Postinstall\(\) {
+    my \(
+        $self
+    \) = @_\;
+    return $self->_install\(1\)\;
+}
+
+#----------------------------------------------------------------------------
+
+sub Preuninstall\(\) {
+    my \(
+        $self
+    \) = @_\;
+    return $self->_install\(0\)\;
+}
+
+#----------------------------------------------------------------------------
+
+sub _install\(\) {
+    my \(
+        $self,
+        $register # 1 for install, 0 for uninstall
+    \) = @_\;
+    my $path = $self->getPath\(\)\;
+    my $dotnetInfo = $self->_getDotNetInfo\(\)\;
+    if\(not defined $dotnetInfo\) {
+        return undef\;
+    }
+    my $actionCaption = $register ? 'Registering' : 'Unregistering'\;
+    if\(not $dotnetInfo\) {
+        $self->AddMessage\(\"Not $actionCaption ADO.NET provider:  no suitable .NET version found.\"\)\;
+        return 1\;
+    }
+    my $adoDir = $path.'\\ado.net'\;
+    my $dotnetVersion = $dotnetInfo->{'version'}\;
+    my $msg = $self->AddMessage\(\"$actionCaption ADO.NET provider for $dotnetVersion\"\)\;
+    my $adoSetup = $adoDir.'\\'.$dotnetInfo->{'setup'}\;
+    my $exer = undef\;
+    if\($register\) {
+        # e.g. \"C:\hdbclient\ado.net\v4.5\SetupNet.v4.5.exe /i /hl C:\hdbclient\ado.net /silent\"
+        $exer = new LCM::ProcessExecutor\($adoSetup, [ '/i', '/hl', $adoDir, '/silent' ]\)\;
+    }
+    else {
+        # e.g. \"C:\hdbclient\ado.net\v4.5\SetupNet.v4.5.exe /silent /u\"
+        $exer = new LCM::ProcessExecutor\($adoSetup, [ '/silent', '/u' ]\)\;
+    }
+    my $exitCode = $exer->executeProgram\(\)\;
+    if \(!defined $exitCode || $exitCode\){
+        $self->AddSubMsgLst \($msg, $exer->getMsgLst\(\)\)\;
+        $self->AddError\($exer->getErrorString\(\)\)\;
+        return undef\;
+    }
+    $self->AddSubMsgLst \($msg, $exer->getMsgLst\(\)\)\;
+    return 1\;
+}
+
+#----------------------------------------------------------------------------
+
+# returns one hash from the list below, or 0 for nothing found\(, or undef for error\)
+sub _getDotNetInfo\(\) {
+    my \(
+        $self
+    \) = @_\;
+    my $rootKey = HKEY_LOCAL_MACHINE\;
+    my $versions = [ # first match will be processed in _install\(\):
+        {
+            'version' => 'v4.5', # for display in output and log.
+            'regKey'  => 'SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Client',
+            'setup'   => 'v4.5\\SetupNet.v4.5.exe'
+        },
+        {
+            'version' => 'v3.5', # for display in output and log.
+            'regKey'  => 'SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v2.0.50727',
+            'setup'   => 'v3.5\\SetupNet.v3.5.exe'
+        }
+    ]\;
+    my $retval = 0\;
+    foreach $entry \(@{$versions}\) {
+        my $hKey\;
+        my $desi = KEY_QUERY_VALUE | KEY_WOW64_64KEY\;
+        my $rc = RegOpenKeyEx\($rootKey, $entry->{'regKey'}, 0, $desi, $hKey\)\;
+        if\($rc != 0\) {
+            next\;
+        }
+        my $str\;
+        my $size\;
+        $rc = RegQueryValueEx\($hKey, \"Install\", 0, 0, $str, \$size\)\;
+        if\($rc == 0\) {
+            $retval = $entry\;
+            RegCloseKey\($hKey\)\;
+            last\;
+        }
+    }
+    return $retval\;
+}
+
+1\;
+"";;""checksum"" => ""e2dafc395f1e887948eaf9fbc902e496"";;""git_hash"" => undef;;""requires"" => ARRAY(HASH(""str"" => ""manifest"";;""id"" => ""manifest""));;""type"" => undef;;""debugArchive"" => ""ADONET.DEBUG.TGZ"";;""buildstring"" => ""1.00.120.091.1519763291"";;""files"" => HASH(""ado.net/v3.5/Sap.Data.Hana.v3.5.dll.config"" => HASH(""mtime"" => ""1519763983"";;""checksum"" => ""441772cc67029522596c540a221f35b4"";;""size"" => ""484"";;""mode"" => ""420"");;""ado.net/v4.5/policy.1.0.Sap.Data.Hana.v4.5.dll"" => HASH(""checksum"" => ""56c9fbcf3a4480a49ff7f99b0e3e372a"";;""mtime"" => ""1519764012"";;""mode"" => ""420"";;""size"" => ""3584"");;""libadonetHDB.pdb"" => HASH(""size"" => ""281600"";;""mode"" => ""420"";;""checksum"" => ""3f59abfb59cc663d2586a4ef82606ece"";;""mtime"" => ""1519764175"";;""dbg"" => ""1"");;""Sap.Data.Hana.v4.5.pdb"" => HASH(""checksum"" => ""aa6a4fb7c8be616b8e1f4f18064ce1ac"";;""dbg"" => ""1"";;""mtime"" => ""1519764012"";;""mode"" => ""420"";;""size"" => ""728576"");;""ado.net/v3.5/policy.1.0.Sap.Data.Hana.v3.5.dll"" => HASH(""size"" => ""3584"";;""mode"" => ""420"";;""mtime"" => ""1519764012"";;""checksum"" => ""36b12d49c3b04dcbccb6978e4d3c862e"");;""ado.net/v3.5/SetupNet.v3.5.exe"" => HASH(""checksum"" => ""057a53c111bdc9156c3a9efe4bf8a836"";;""mtime"" => ""1519764012"";;""size"" => ""61440"";;""mode"" => ""493"");;""ado.net/v4.5/Sap.Data.Hana.v4.5.xml"" => HASH(""mtime"" => ""1519764012"";;""checksum"" => ""bebd50d0ffc5957d7a187d5b1ac94f11"";;""size"" => ""383380"";;""mode"" => ""420"");;""libadonetHDB.dll"" => HASH(""size"" => ""64000"";;""mode"" => ""420"";;""mtime"" => ""1519764175"";;""checksum"" => ""1a8d57597c5d87243557676ef4681a33"");;""Sap.Data.Hana.v3.5.pdb"" => HASH(""dbg"" => ""1"";;""mtime"" => ""1519764012"";;""checksum"" => ""41f6bc9b178b947905ca2c85bc3f496c"";;""size"" => ""470528"";;""mode"" => ""420"");;""ado.net/v3.5/Sap.Data.Hana.v3.5.xml"" => HASH(""mtime"" => ""1519764012"";;""checksum"" => ""4145c883939fd4225da2f57ebba50cac"";;""mode"" => ""420"";;""size"" => ""267564"");;""ado.net/v3.5/Sap.Data.Hana.v3.5.dll"" => HASH(""checksum"" => ""053075610d31b83fdf1e34bd67965057"";;""mtime"" => ""1519764012"";;""size"" => ""249856"";;""mode"" => ""420"");;""ado.net/v4.5/SetupNet.v4.5.exe"" => HASH(""mtime"" => ""1519764012"";;""checksum"" => ""843aeb89b2440807bd14943bd4b2b098"";;""mode"" => ""493"";;""size"" => ""50688"");;""ado.net/v4.5/Sap.Data.Hana.v4.5.dll.config"" => HASH(""mtime"" => ""1519763983"";;""checksum"" => ""31601d81761b1e94ce9b6d71da1ed716"";;""mode"" => ""420"";;""size"" => ""484"");;""ado.net/v3.5/Sap.VSPackage.Hana.dll"" => HASH(""size"" => ""160768"";;""mode"" => ""420"";;""checksum"" => ""9fbce787f3d87df3a9169bcf0ca39ed4"";;""mtime"" => ""1519764024"");;""ado.net/v4.5/SSDLToHana.tt"" => HASH(""mtime"" => ""1519764012"";;""checksum"" => ""ba53c0c8dc893dd3021f07b1df3e90bd"";;""mode"" => ""420"";;""size"" => ""8712"");;""ado.net/v4.5/Sap.Data.Hana.v4.5.dll"" => HASH(""mtime"" => ""1519764012"";;""checksum"" => ""393def1f74cff1495b375d54f188d552"";;""size"" => ""493568"";;""mode"" => ""420"");;""Sap.VSPackage.Hana.pdb"" => HASH(""size"" => ""128512"";;""mode"" => ""420"";;""checksum"" => ""7436c0a4bd6f1cb0b7f40c34018e6a58"";;""mtime"" => ""1519764024"";;""dbg"" => ""1""));;""size"" => ""3357328"";;""desc"" => ""ADO.NET Provider"";;""modtime"" => ""1702542470"";;""isClientPackage"" => ""1"";;""name"" => ""ADO.NET"");;""sqldbc"" => HASH(""modtime"" => ""1702542467"";;""desc"" => ""C/C++ interface"";;""name"" => ""SQLDBC"";;""isClientPackage"" => ""1"";;""files"" => HASH(""hdbsql.pdb"" => HASH(""mode"" => ""420"";;""size"" => ""3673088"";;""checksum"" => ""70164e55e4a155241535d2a87670fef9"";;""mtime"" => ""1519764183"";;""dbg"" => ""1"");;""libSQLDBCHDB.pdb"" => HASH(""mode"" => ""420"";;""size"" => ""3533824"";;""mtime"" => ""1519764162"";;""dbg"" => ""1"";;""checksum"" => ""ed15985fbe2487fe1327c76ac994bec7"");;""hdbsqldbc_cons32.exe"" => HASH(""size"" => ""1168384"";;""mode"" => ""493"";;""checksum"" => ""a49da6a910476ee409534b7cae007271"";;""mtime"" => ""1519764183"");;""hdbuserstore.pdb"" => HASH(""size"" => ""3566592"";;""mode"" => ""420"";;""checksum"" => ""3c4d733f4e8fe0e5792f2db4b8833f71"";;""dbg"" => ""1"";;""mtime"" => ""1519764183"");;""hdbuserstore.exe"" => HASH(""checksum"" => ""fa88a71903b7863df08c9213d9d29fa0"";;""mtime"" => ""1519764184"";;""size"" => ""5230592"";;""mode"" => ""493"");;""libSQLDBCHDB.dll"" => HASH(""checksum"" => ""fee547cb2036601a08ad40a2cdbe32a6"";;""mtime"" => ""1519764163"";;""size"" => ""5191168"";;""mode"" => ""420"");;""hdbsql.exe"" => HASH(""mtime"" => ""1519764183"";;""checksum"" => ""dfe3723226e15100fa8ccab75870fbf9"";;""size"" => ""5281280"";;""mode"" => ""493""));;""buildstring"" => ""1.00.120.091.1519763291"";;""size"" => ""27644928"";;""type"" => undef;;""debugArchive"" => ""SQLDBC.DEBUG.TGZ"";;""requires"" => ARRAY(HASH(""id"" => ""manifest"";;""str"" => ""manifest""));;""git_hash"" => undef;;""checksum"" => ""126b6fad0f04145a4eb803e8ebbfe628"";;""valid"" => ""1"";;""version"" => ""1.00.120.091.1519763291"";;""script"" => ""use SDB::Install::SysVars\;
+use SDB::Install::System qw \(exec_program\)\;
+
+use strict\;
+
+our $listname = 'hdbclient.lst'\;
+
+sub getExternalFileListName{
+    return $listname\;
+}
+
+sub Postinstall\(\) {
+        my \(
+            $self
+        \) = @_\;
+        my $path = $self->getPath\(\)\;
+        my $exeExt = $isWin ? '.exe' : ''\;
+        my $sqldbcCons = $path.$path_separator.'hdbsqldbc_cons'.$exeExt\;
+        if\(-f $sqldbcCons\) {
+            $self->AddMessage\(\"Running $sqldbcCons to detect and remove invalid shared memory.\"\)\;
+            my $rc = exec_program\($sqldbcCons, ['-w', '256']\)\;
+            if\(defined $rc\) { 
+                $self->AddMessage\(\"$sqldbcCons returned $rc.\"\)\;
+            }
+        }
+        return 1\;
+}
+
+1\;
+""));;""ID"" => ""MaxDB InstallRegistry"")
